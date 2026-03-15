@@ -4,6 +4,9 @@ from camera import OrbitCamera
 import numpy as np
 import pygame
 
+SPLAT_SCALE = 5.0
+NUM_RENDER_MODES = 2 
+
 def load_splats(path):
     with open(path, 'rb') as f:
         raw = f.read()
@@ -29,7 +32,30 @@ def load_splats(path):
     print(f"Naloženo {n} splatov iz '{path}'")
     return positions, colors
 
-def render_points(framebuffer, positions, colors, view, proj, width, height):
+
+def render_mode_1(framebuffer, px, py, valid, colors, width, height):
+    px_v = np.round(px[valid]).astype(np.int32)
+    py_v = np.round(py[valid]).astype(np.int32)
+    in_bounds = (px_v >= 0) & (px_v < width) & (py_v >= 0) & (py_v < height)
+    framebuffer[py_v[in_bounds], px_v[in_bounds]] = colors[valid][in_bounds, :3]
+
+
+def render_mode_2(framebuffer, px, py, valid, depth, colors, width, height):
+    half_size = SPLAT_SCALE / np.where(valid, depth, 1.0)
+    order = np.argsort(depth)[::-1]  # far first, close last
+    for i in order:
+        if not valid[i]:
+            continue
+        center_x, center_y = px[i], py[i]
+        x_lo = max(0, int(np.floor(center_x - half_size[i])))
+        x_hi = min(width, int(np.ceil(center_x + half_size[i])))
+        y_lo = max(0, int(np.floor(center_y - half_size[i])))
+        y_hi = min(height, int(np.ceil(center_y + half_size[i])))
+        if x_lo >= x_hi or y_lo >= y_hi:
+            continue
+        framebuffer[y_lo:y_hi, x_lo:x_hi] = colors[i, :3]
+
+def render_points(framebuffer, positions, colors, view, proj, width, height, mode):
     N = len(positions)
 
     # Build homogeneous coordinates (N, 4) 
@@ -58,15 +84,15 @@ def render_points(framebuffer, positions, colors, view, proj, width, height):
     px = ( ndc_x * 0.5 + 0.5) * width
     py = (-ndc_y * 0.5 + 0.5) * height
 
-    # Keep only valid splats and round to nearest pixel
-    px_v = np.round(px[valid]).astype(np.int32)
-    py_v = np.round(py[valid]).astype(np.int32)
-
-    # Bounds check: rounding can give px_v=width or py_v=height (out of range)
-    in_bounds = (px_v >= 0) & (px_v < width) & (py_v >= 0) & (py_v < height)
-
-    # Write RGB into framebuffer (last-writer wins — no depth sort in Task 3.1)
-    framebuffer[py_v[in_bounds], px_v[in_bounds]] = colors[valid][in_bounds, :3]
+    if mode == 1:
+        render_mode_1(framebuffer, px, py, valid, colors, width, height)
+    elif mode == 2:
+        view_space = (view.astype(np.float64) @ homogeneous_coordinates.T).T
+        view_z = view_space[:, 2]
+        depth = -view_z  # positive depth in front of camera (camera looks along -Z)
+        valid &= depth > 1e-6  # exclude behind camera for mode 2
+        render_mode_2(framebuffer, px, py, valid, depth, colors, width, height)
+    # Add mode 3, 4, ... here
 
 
 def camera_init(positions, width, height):
@@ -105,6 +131,7 @@ def main():
     framebuffer = np.ones((HEIGHT, WIDTH, 3), dtype=np.float32) 
     surface_framebuffer = pygame.Surface((WIDTH, HEIGHT)) # surface_framebuffer is a pygame surface that we can blit to the screen
     frame_ms = 0.0
+    render_mode = 1
 
     running = True
     while running:
@@ -129,6 +156,11 @@ def main():
                     fname = "screenshot.png"
                     pygame.image.save(screen, fname)
 
+                elif event.key == pygame.K_1:
+                    render_mode = 1
+                elif event.key == pygame.K_2:
+                    render_mode = 2
+
             else:
                 camera.handle_event(event)
 
@@ -139,7 +171,7 @@ def main():
 
         framebuffer[:] = 1.0  # clear to white before rendering
         view, proj = camera.get_view_proj()
-        render_points(framebuffer, positions, colors, view, proj, WIDTH, HEIGHT)
+        render_points(framebuffer, positions, colors, view, proj, WIDTH, HEIGHT, render_mode)
 
         frame_ms = (time.perf_counter() - start_time) * 1000.0
 
@@ -151,9 +183,9 @@ def main():
         screen.blit(surface_framebuffer, (0, 0)) # blit the framebuffer to the screen at the origin
 
         display_text = [
-            f"Splats: {len(positions)}    FPS: {1000.0 / max(frame_ms, 0.001):.1f}",
+            f"Splats: {len(positions)}    FPS: {1000.0 / max(frame_ms, 0.001):.1f}   Mode: {render_mode}",
             f"FOV: {camera.fovy:.0f} deg    Radius: {camera.radius:.3f}",
-            "scroll / W / S  zoom   R  reset   P  screenshot",
+            "1 / 2  render mode   scroll / W / S  zoom   R  reset   P  screenshot",
         ]
         for row, text in enumerate(display_text):
             surf = pygame.font.SysFont("monospace", 14).render(text, True, (255, 255, 0), (0, 0, 0))
