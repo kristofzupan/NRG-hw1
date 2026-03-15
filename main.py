@@ -5,7 +5,7 @@ import numpy as np
 import pygame
 
 SPLAT_SCALE = 5.0
-NUM_RENDER_MODES = 3 
+NUM_RENDER_MODES = 4 
 
 def load_splats(path):
     with open(path, 'rb') as f:
@@ -40,8 +40,8 @@ def render_mode_1(framebuffer, px, py, valid, colors, width, height):
     framebuffer[py_v[in_bounds], px_v[in_bounds]] = colors[valid][in_bounds, :3]
 
 
-def render_mode_2(framebuffer, px, py, valid, depth, colors, width, height):
-    half_size = SPLAT_SCALE / np.where(valid, depth, 1.0)
+def render_mode_2(framebuffer, px, py, valid, depth, colors, width, height, splat_scale):
+    half_size = splat_scale / np.where(valid, depth, 1.0)
     order = np.argsort(depth)[::-1]  # far first, close last
     for i in order:
         if not valid[i]:
@@ -54,18 +54,16 @@ def render_mode_2(framebuffer, px, py, valid, depth, colors, width, height):
         if x_low >= x_high or y_low >= y_high:
             continue
         framebuffer[y_low:y_high, x_low:x_high] = colors[i, :3]
-        
 
-def render_mode_3(framebuffer, px, py, valid, depth, colors, width, height):
-    """Order-correct blending: sort by depth (back-to-front), blend with straight alpha.
-    RGB'd = (1 - As) * RGBd + As * RGBs. Framebuffer is initialized to (1, 1, 1)."""
-    half_size = SPLAT_SCALE / np.where(valid, depth, 1.0)
+
+def render_mode_3(framebuffer, px, py, valid, depth, colors, width, height, splat_scale):
+    half_size = splat_scale / np.where(valid, depth, 1.0)
     order = np.argsort(depth)[::-1]  # far first, close last (back-to-front)
     for i in order:
         if not valid[i]:
             continue
-        as_alpha = colors[i, 3]
-        if as_alpha <= 0.0: 
+        alpha_splat = colors[i, 3]
+        if alpha_splat <= 0.0: 
             continue
         # Source color with straight alpha: use RGBs, As for blending
         rgb_s = colors[i, :3]
@@ -78,10 +76,47 @@ def render_mode_3(framebuffer, px, py, valid, depth, colors, width, height):
             continue
         # Blend: RGB'd = (1 - As) * RGBd + As * RGBs
         rgb_d = framebuffer[y_low:y_high, x_low:x_high]
-        framebuffer[y_low:y_high, x_low:x_high] = (1.0 - as_alpha) * rgb_d + as_alpha * rgb_s
+        framebuffer[y_low:y_high, x_low:x_high] = (1.0 - alpha_splat) * rgb_d + alpha_splat * rgb_s
 
 
-def render_points(framebuffer, positions, colors, view, proj, width, height, mode):
+# Gaussian falloff - alpha at each pixel = splat_alpha * g(x), with g(x) = exp(-1/2 * (x-c)^T Sigma^{-1} (x-c)).
+def render_mode_4(framebuffer, px, py, valid, depth, colors, width, height, splat_scale):
+    half_size = splat_scale / np.where(valid, depth, 1.0)
+    order = np.argsort(depth)[::-1]  # back-to-front
+    for i in order:
+        if not valid[i]:
+            continue
+
+        alpha_splat = colors[i, 3]
+        if alpha_splat <= 0.0:
+            continue
+
+        rgb_s = colors[i, :3]
+        center_x, center_y = float(px[i]), float(py[i])
+        sigma = half_size[i]  # s/z in pixels (uniform scaling)
+
+        # Calculate the bounds of the gaussian falloff so we don't calculate the gaussian falloff for pixels that are outside the bounds of the splat and waste time.
+        x_low = max(0, int(np.floor(center_x - sigma * 3)))   
+        x_high = min(width, int(np.ceil(center_x + sigma * 3)))
+        y_low = max(0, int(np.floor(center_y - sigma * 3)))
+        y_high = min(height, int(np.ceil(center_y + sigma * 3)))
+        if x_low >= x_high or y_low >= y_high:
+            continue # If the bounds are outside the width or height of the framebuffer, skip the pixel.
+
+        yy, xx = np.ogrid[y_low:y_high, x_low:x_high] # Create a grid of y and x coordinates
+        dx = xx.astype(np.float64) - center_x # x - center_x
+        dy = yy.astype(np.float64) - center_y # y - center_y
+
+        d_sq = dx**2 + dy**2 # Calculate the squared distance between the pixel and the center of the splat.
+        sigma_sq = sigma**2 # Calculate the squared sigma.
+
+        g = np.exp(-0.5 * d_sq / (sigma_sq + 1e-20))
+        effective_alpha = (alpha_splat * g).astype(np.float32)[..., np.newaxis] # We multiply the alpha of the splat by the gaussian falloff to get the effective alpha.
+        rgb_d = framebuffer[y_low:y_high, x_low:x_high] # Previous color of the pixel.
+        framebuffer[y_low:y_high, x_low:x_high] = ((1.0 - effective_alpha) * rgb_d + effective_alpha * rgb_s) # Blend the previous color of the pixel with the new color of the pixel according to the effective alpha.
+
+
+def render_points(framebuffer, positions, colors, view, proj, width, height, mode, splat_scale):
     N = len(positions)
 
     # Build homogeneous coordinates (N, 4) 
@@ -117,13 +152,19 @@ def render_points(framebuffer, positions, colors, view, proj, width, height, mod
         view_z = view_space[:, 2]
         depth = -view_z  # positive depth in front of camera (camera looks along -Z)
         valid &= depth > 1e-6  # exclude behind camera for mode 2
-        render_mode_2(framebuffer, px, py, valid, depth, colors, width, height)
+        render_mode_2(framebuffer, px, py, valid, depth, colors, width, height, splat_scale)
     elif mode == 3:
         view_space = (view.astype(np.float64) @ homogeneous_coordinates.T).T
         view_z = view_space[:, 2]
         depth = -view_z
         valid &= depth > 1e-6
-        render_mode_3(framebuffer, px, py, valid, depth, colors, width, height)
+        render_mode_3(framebuffer, px, py, valid, depth, colors, width, height, splat_scale)
+    elif mode == 4:
+        view_space = (view.astype(np.float64) @ homogeneous_coordinates.T).T
+        view_z = view_space[:, 2]
+        depth = -view_z
+        valid &= depth > 1e-6
+        render_mode_4(framebuffer, px, py, valid, depth, colors, width, height, splat_scale)
 
 
 def camera_init(positions, width, height):
@@ -163,6 +204,7 @@ def main():
     surface_framebuffer = pygame.Surface((WIDTH, HEIGHT)) # surface_framebuffer is a pygame surface that we can blit to the screen
     frame_ms = 0.0
     render_mode = 1
+    splat_scale = SPLAT_SCALE
 
     running = True
     while running:
@@ -182,6 +224,12 @@ def main():
                     camera.target = init_target.copy()
                     camera.yaw    = 30.0
                     camera.pitch  = 15.0
+                    splat_scale = SPLAT_SCALE
+
+                elif event.key == pygame.K_EQUALS or event.key == pygame.K_PLUS:
+                    splat_scale = min(100.0, splat_scale * 1.2)
+                elif event.key == pygame.K_MINUS:
+                    splat_scale = max(0.1, splat_scale / 1.2)
 
                 elif event.key == pygame.K_p:
                     fname = "screenshot.png"
@@ -193,6 +241,8 @@ def main():
                     render_mode = 2
                 elif event.key == pygame.K_3:
                     render_mode = 3
+                elif event.key == pygame.K_4:
+                    render_mode = 4
 
             else:
                 camera.handle_event(event)
@@ -204,7 +254,7 @@ def main():
 
         framebuffer[:] = 1.0  # clear to white before rendering
         view, proj = camera.get_view_proj()
-        render_points(framebuffer, positions, colors, view, proj, WIDTH, HEIGHT, render_mode)
+        render_points(framebuffer, positions, colors, view, proj, WIDTH, HEIGHT, render_mode, splat_scale)
 
         frame_ms = (time.perf_counter() - start_time) * 1000.0
 
@@ -216,9 +266,9 @@ def main():
         screen.blit(surface_framebuffer, (0, 0)) # blit the framebuffer to the screen at the origin
 
         display_text = [
-            f"Splats: {len(positions)}    FPS: {1000.0 / max(frame_ms, 0.001):.1f}   Mode: {render_mode}",
+            f"Splats: {len(positions)}    FPS: {1000.0 / max(frame_ms, 0.001):.1f}   Mode: {render_mode}   Splat scale: {splat_scale:.2f}",
             f"FOV: {camera.fovy:.0f} deg    Radius: {camera.radius:.3f}",
-            "1 / 2 / 3  render mode   scroll / W / S  zoom   R  reset   P  screenshot",
+            "1-4  mode   + / -  splat scale   W / S  zoom   R  reset   P  screenshot",
         ]
         for row, text in enumerate(display_text):
             surf = pygame.font.SysFont("monospace", 14).render(text, True, (255, 255, 0), (0, 0, 0))
