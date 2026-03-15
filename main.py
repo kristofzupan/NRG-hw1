@@ -5,7 +5,7 @@ import numpy as np
 import pygame
 
 SPLAT_SCALE = 5.0
-NUM_RENDER_MODES = 2 
+NUM_RENDER_MODES = 3 
 
 def load_splats(path):
     with open(path, 'rb') as f:
@@ -47,13 +47,39 @@ def render_mode_2(framebuffer, px, py, valid, depth, colors, width, height):
         if not valid[i]:
             continue
         center_x, center_y = px[i], py[i]
-        x_lo = max(0, int(np.floor(center_x - half_size[i])))
-        x_hi = min(width, int(np.ceil(center_x + half_size[i])))
-        y_lo = max(0, int(np.floor(center_y - half_size[i])))
-        y_hi = min(height, int(np.ceil(center_y + half_size[i])))
-        if x_lo >= x_hi or y_lo >= y_hi:
+        x_low = max(0, int(np.floor(center_x - half_size[i])))
+        x_high = min(width, int(np.ceil(center_x + half_size[i])))
+        y_low = max(0, int(np.floor(center_y - half_size[i])))
+        y_high = min(height, int(np.ceil(center_y + half_size[i])))
+        if x_low >= x_high or y_low >= y_high:
             continue
-        framebuffer[y_lo:y_hi, x_lo:x_hi] = colors[i, :3]
+        framebuffer[y_low:y_high, x_low:x_high] = colors[i, :3]
+        
+
+def render_mode_3(framebuffer, px, py, valid, depth, colors, width, height):
+    """Order-correct blending: sort by depth (back-to-front), blend with straight alpha.
+    RGB'd = (1 - As) * RGBd + As * RGBs. Framebuffer is initialized to (1, 1, 1)."""
+    half_size = SPLAT_SCALE / np.where(valid, depth, 1.0)
+    order = np.argsort(depth)[::-1]  # far first, close last (back-to-front)
+    for i in order:
+        if not valid[i]:
+            continue
+        as_alpha = colors[i, 3]
+        if as_alpha <= 0.0: 
+            continue
+        # Source color with straight alpha: use RGBs, As for blending
+        rgb_s = colors[i, :3]
+        center_x, center_y = px[i], py[i]
+        x_low = max(0, int(np.floor(center_x - half_size[i])))
+        x_high = min(width, int(np.ceil(center_x + half_size[i])))
+        y_low = max(0, int(np.floor(center_y - half_size[i])))
+        y_high = min(height, int(np.ceil(center_y + half_size[i])))
+        if x_low >= x_high or y_low >= y_high:
+            continue
+        # Blend: RGB'd = (1 - As) * RGBd + As * RGBs
+        rgb_d = framebuffer[y_low:y_high, x_low:x_high]
+        framebuffer[y_low:y_high, x_low:x_high] = (1.0 - as_alpha) * rgb_d + as_alpha * rgb_s
+
 
 def render_points(framebuffer, positions, colors, view, proj, width, height, mode):
     N = len(positions)
@@ -92,7 +118,12 @@ def render_points(framebuffer, positions, colors, view, proj, width, height, mod
         depth = -view_z  # positive depth in front of camera (camera looks along -Z)
         valid &= depth > 1e-6  # exclude behind camera for mode 2
         render_mode_2(framebuffer, px, py, valid, depth, colors, width, height)
-    # Add mode 3, 4, ... here
+    elif mode == 3:
+        view_space = (view.astype(np.float64) @ homogeneous_coordinates.T).T
+        view_z = view_space[:, 2]
+        depth = -view_z
+        valid &= depth > 1e-6
+        render_mode_3(framebuffer, px, py, valid, depth, colors, width, height)
 
 
 def camera_init(positions, width, height):
@@ -160,6 +191,8 @@ def main():
                     render_mode = 1
                 elif event.key == pygame.K_2:
                     render_mode = 2
+                elif event.key == pygame.K_3:
+                    render_mode = 3
 
             else:
                 camera.handle_event(event)
@@ -185,7 +218,7 @@ def main():
         display_text = [
             f"Splats: {len(positions)}    FPS: {1000.0 / max(frame_ms, 0.001):.1f}   Mode: {render_mode}",
             f"FOV: {camera.fovy:.0f} deg    Radius: {camera.radius:.3f}",
-            "1 / 2  render mode   scroll / W / S  zoom   R  reset   P  screenshot",
+            "1 / 2 / 3  render mode   scroll / W / S  zoom   R  reset   P  screenshot",
         ]
         for row, text in enumerate(display_text):
             surf = pygame.font.SysFont("monospace", 14).render(text, True, (255, 255, 0), (0, 0, 0))
