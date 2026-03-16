@@ -6,7 +6,7 @@ import pygame
 def look_at(eye, target):
     eye = np.asarray(eye, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
-    world_up = np.array([0.0, 1.0, 0.0]) # world up is +Y
+    world_up = np.array([0.0, -1.0, 0.0]) # world up is +Y
 
     # Camera axes in world space (right-handed: X right, Y up, Z out of screen)
     forward = target - eye
@@ -103,8 +103,8 @@ class OrbitCamera:
 
             if self._dragging_left and (dx != 0 or dy != 0):
                 # Orbit: change yaw and pitch
-                self.yaw -= dx * 0.4
-                self.pitch -= dy * 0.4
+                self.yaw += dx * 0.4
+                self.pitch += dy * 0.4
                 self.pitch = max(-89.0, min(89.0, self.pitch))
 
             elif self._dragging_right and (dx != 0 or dy != 0):

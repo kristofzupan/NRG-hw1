@@ -5,7 +5,7 @@ import numpy as np
 import pygame
 
 SPLAT_SCALE = 5.0
-NUM_RENDER_MODES = 4 
+NUM_RENDER_MODES = 5
 
 def load_splats(path):
     with open(path, 'rb') as f:
@@ -20,17 +20,23 @@ def load_splats(path):
         ('rotation', np.uint8, (4)),
     ]))
 
-    # Copy positions and convert coordinate system: splat files uses COLMAP convention (Y-down, Z-forward)
-    # OpenGL convention uses Y-up, Z-backward so we negate Y and Z to get the right-handed system!
+    # Copy positions from the file as-is; we treat the file's coordinate system as our world space.
     positions = data['position'].astype(np.float32).copy()
-    positions[:, 1] *= -1
-    positions[:, 2] *= -1
 
     # Convert colors from uint8 to float32
     colors = data['color'].astype(np.float32) / 255.0
 
+    scales = data['scale'].astype(np.float32).copy()
+
+    rotation_uint8 = data['rotation']
+    rotations = (rotation_uint8.astype(np.float32) - 128.0) / 128.0 # (c−128)/128)
+    # Normalize to unit quaternion  - described in the paper section 4.
+    qnorm = np.linalg.norm(rotations, axis=1, keepdims=True)
+    qnorm = np.where(qnorm < 1e-8, 1.0, qnorm)
+    rotations = rotations / qnorm
+
     print(f"Naloženo {n} splatov iz '{path}'")
-    return positions, colors
+    return positions, colors, scales, rotations
 
 
 def render_mode_1(framebuffer, px, py, valid, colors, width, height):
@@ -115,8 +121,119 @@ def render_mode_4(framebuffer, px, py, valid, depth, colors, width, height, spla
         rgb_d = framebuffer[y_low:y_high, x_low:x_high] # Previous color of the pixel.
         framebuffer[y_low:y_high, x_low:x_high] = ((1.0 - effective_alpha) * rgb_d + effective_alpha * rgb_s) # Blend the previous color of the pixel with the new color of the pixel according to the effective alpha.
 
+def quaternion_to_rotation_matrix(q):
+    # https://en.wikipedia.org/wiki/Quaternions_and_spatial_rotation#Quaternion-derived_rotation_matrix
+    q_r, q_i, q_j, q_k = q[:, 0], q[:, 1], q[:, 2], q[:, 3]  
+    s = 1.0 / (q_r * q_r + q_i * q_i + q_j * q_j + q_k * q_k + 1e-20)  # s = ‖q‖^{-2}
+    two_s = 2.0 * s
+    R = np.empty((len(q_r), 3, 3), dtype=np.float64)
+    R[:, 0, 0] = 1 - two_s * (q_j * q_j + q_k * q_k)
+    R[:, 0, 1] = two_s * (q_i * q_j - q_r * q_k)
+    R[:, 0, 2] = two_s * (q_i * q_k + q_r * q_j)
+    R[:, 1, 0] = two_s * (q_i * q_j + q_r * q_k)
+    R[:, 1, 1] = 1 - two_s * (q_i * q_i + q_k * q_k)
+    R[:, 1, 2] = two_s * (q_j * q_k - q_r * q_i)
+    R[:, 2, 0] = two_s * (q_i * q_k - q_r * q_j)
+    R[:, 2, 1] = two_s * (q_j * q_k + q_r * q_i)
+    R[:, 2, 2] = 1 - two_s * (q_i * q_i + q_j * q_j)
+    return R.astype(np.float32)
 
-def render_points(framebuffer, positions, colors, view, proj, width, height, mode, splat_scale):
+def build_covariance_matrix(rotations, scales):
+    # Σ = R S Sᵀ Rᵀ 
+    R = quaternion_to_rotation_matrix(rotations.astype(np.float64))
+    S = np.zeros((len(scales), 3, 3), dtype=np.float64)
+    S[:, 0, 0] = scales[:, 0]
+    S[:, 1, 1] = scales[:, 1]
+    S[:, 2, 2] = scales[:, 2]
+    # We transpose (0, 2, 1) because we have a batch of 3×3 matrices and we only want to transpose each matrix, not the batch.
+    covariance_matrix = (R @ S @ S.transpose(0, 2, 1) @ R.transpose(0, 2, 1)).astype(np.float32)
+    return covariance_matrix
+
+# Σ' = J W Σ Wᵀ Jᵀ
+def project_cov3d_world_to_screen(cov3_world, view, view_pts3, fx, fy):
+    W3 = view[:3, :3].astype(np.float32) # W (we get it from the view matrix - the upper-left 3×3 of the view matrix)
+
+    # W Σ Wᵀ - for all N Gaussians. np.newaxis adds a leading dimension
+    cov3_view = (W3[np.newaxis] @ cov3_world @ W3.T[np.newaxis]).astype(np.float32)
+
+    # Build Jacobian (25 - formula in paper) 
+    # u0, u1, u2 are the x, y, z coordinates of the Gaussian in camera (view) space.
+    u0 = view_pts3[:, 0].astype(np.float32)  # X = u0
+    u1 = view_pts3[:, 1].astype(np.float32)  # Y = u1
+    u2 = view_pts3[:, 2].astype(np.float32)  # Z = u2
+    u2_safe = np.where(np.abs(u2) < 1e-6, np.float32(-1e-6), u2) # Avoid division by zero
+    inv_u2 = np.float32(1.0) / u2_safe       # 1 / u2
+
+    N = len(u2)
+    J = np.zeros((N, 2, 3), dtype=np.float32)
+    #   J = [ 1/u2     0    -u0/u2^2 ]
+    #       [   0    1/u2   -u1/u2^2 ]
+    #       [ u0/l   u1/l    u2/l   ] ,  with l = ||(u0,u1,u2)^T||
+    # We only need the first two rows (mapping to 2D), then scale by fx, fy to get pixel coords.
+    # QUOTE:
+    """
+    Σ' = J W Σ Wᵀ Jᵀ
+    where 𝐽 is the Jacobian of the affine approximation of the projective
+    transformation. Zwicker et al. [2001a] also show that if we skip the
+    third row and column of Σ′, we obtain a 2×2 variance matrix with
+    the same structure and properties as if we would start from planar
+    points with normals, as in previous work [Kopanas et al. 2021].
+    """
+    J[:, 0, 0] = -float(fx) * inv_u2
+    J[:, 0, 2] = float(fx) * u0 * inv_u2**2  
+    J[:, 1, 1] = float(fy) * inv_u2
+    J[:, 1, 2] = -float(fy) * u1 * inv_u2**2
+
+    # Σ' = J Σ_view Jᵀ = J W Σ Wᵀ Jᵀ
+    cov2 = (J @ cov3_view @ J.transpose(0, 2, 1)).astype(np.float32)
+    return cov2
+
+
+# Non-uniform Gaussian falloff 
+def render_mode_5(framebuffer, px, py, valid, depth, view_pts3, colors, rotations, scales, view, proj, width, height):
+    fx = float(proj[0, 0]) * width * 0.5
+    fy = float(proj[1, 1]) * height * 0.5
+
+    cov3_world = build_covariance_matrix(rotations, scales)
+    cov2 = project_cov3d_world_to_screen(cov3_world, view, view_pts3, fx, fy)
+    
+    cov2[:, 0, 0] += 0.3
+    cov2[:, 1, 1] += 0.3  # Regularize to avoid degenerate splats
+
+    order = np.argsort(depth)[::-1]  # back-to-front
+    for i in order:
+        if not valid[i] or colors[i, 3] <= 0.0:
+            continue
+        rgb_s = colors[i, :3]
+        center_x, center_y = float(px[i]), float(py[i])
+
+        a, b, c = cov2[i, 0, 0], cov2[i, 0, 1], cov2[i, 1, 1]  # Σ' = [[a,b],[b,c]] for this splat
+        det = max(a * c - b * b, 1e-10)
+        inv_det = 1.0 / det
+        radius = min(int(np.ceil(2.0 * np.sqrt(max(a + c, 1e-4)))), 96)
+
+        # Bounds of the Gaussian so we don't compute it for pixels outside the splat.
+        x_low = max(0, int(center_x) - radius)
+        x_high = min(width, int(center_x) + radius + 1)
+        y_low = max(0, int(center_y) - radius)
+        y_high = min(height, int(center_y) + radius + 1)
+        if x_low >= x_high or y_low >= y_high:
+            continue  # Bounds outside the framebuffer, skip.
+
+        yy, xx = np.ogrid[y_low:y_high, x_low:x_high]  # Grid of pixel coordinates
+        dx = xx.astype(np.float64) - center_x  # x - center_x
+        dy = yy.astype(np.float64) - center_y  # y - center_y
+
+        # Exponent for elliptical Gaussian - ZPvBG01 (9 - enačba)
+        d_sq = (c * dx * dx - 2.0 * b * dx * dy + a * dy * dy) * inv_det
+        g = np.exp(-0.5 * d_sq)
+        alpha_splat = colors[i, 3]
+        effective_alpha = (alpha_splat * g).astype(np.float32)[..., np.newaxis]
+        rgb_d = framebuffer[y_low:y_high, x_low:x_high]  # Previous color of the pixel.
+        framebuffer[y_low:y_high, x_low:x_high] = (1.0 - effective_alpha) * rgb_d + effective_alpha * rgb_s  # Blend with effective alpha.
+
+
+def render_points(framebuffer, positions, colors, view, proj, width, height, mode, splat_scale, scales=None, rotations=None):
     N = len(positions)
 
     # Build homogeneous coordinates (N, 4) 
@@ -165,6 +282,13 @@ def render_points(framebuffer, positions, colors, view, proj, width, height, mod
         depth = -view_z
         valid &= depth > 1e-6
         render_mode_4(framebuffer, px, py, valid, depth, colors, width, height, splat_scale)
+    elif mode == 5:
+        view_space = (view.astype(np.float64) @ homogeneous_coordinates.T).T
+        view_z = view_space[:, 2]
+        depth = -view_z
+        valid &= depth > 1e-6
+        view_pts3 = view_space[:, :3] # view space x y z coordinates (N,3)
+        render_mode_5(framebuffer, px, py, valid, depth, view_pts3, colors, rotations, scales, view, proj, width, height)
 
 
 def camera_init(positions, width, height):
@@ -189,7 +313,7 @@ def main():
         sys.exit(1)
 
     splat_path = sys.argv[1]
-    positions, colors = load_splats(splat_path)
+    positions, colors, scales, rotations = load_splats(splat_path)
 
     WIDTH, HEIGHT = 1920, 1080 # Viewport size
 
@@ -243,6 +367,8 @@ def main():
                     render_mode = 3
                 elif event.key == pygame.K_4:
                     render_mode = 4
+                elif event.key == pygame.K_5:
+                    render_mode = 5
 
             else:
                 camera.handle_event(event)
@@ -254,7 +380,7 @@ def main():
 
         framebuffer[:] = 1.0  # clear to white before rendering
         view, proj = camera.get_view_proj()
-        render_points(framebuffer, positions, colors, view, proj, WIDTH, HEIGHT, render_mode, splat_scale)
+        render_points(framebuffer, positions, colors, view, proj, WIDTH, HEIGHT, render_mode, splat_scale, scales=scales, rotations=rotations)
 
         frame_ms = (time.perf_counter() - start_time) * 1000.0
 
@@ -268,7 +394,7 @@ def main():
         display_text = [
             f"Splats: {len(positions)}    FPS: {1000.0 / max(frame_ms, 0.001):.1f}   Mode: {render_mode}   Splat scale: {splat_scale:.2f}",
             f"FOV: {camera.fovy:.0f} deg    Radius: {camera.radius:.3f}",
-            "1-4  mode   + / -  splat scale   W / S  zoom   R  reset   P  screenshot",
+            "1-5  mode   + / -  splat scale   W / S  zoom   R  reset   P  screenshot",
         ]
         for row, text in enumerate(display_text):
             surf = pygame.font.SysFont("monospace", 14).render(text, True, (255, 255, 0), (0, 0, 0))
